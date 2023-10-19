@@ -1,0 +1,324 @@
+---
+title: "Sensitivity of similiarities to frequency with different hyperparams."
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir="~/bias-frequency/")
+# setwd("~/bias-frequency/")
+```
+
+
+```{r, message=F, warning=F}
+library(tidyverse)
+library(glue)
+library(latex2exp)
+library(cowplot)
+library(janitor)
+library(texreg)
+library(gg.layers)
+```
+
+
+## Data
+
+```{r}
+# input files
+files = list.files("data/working", pattern=glue("similarities-.+.csv"), full.names=T)
+```
+
+
+```{r}
+# results file (Rmd only reads this if it is available)
+outfile = "results/similarities-frequencies-hps-summary.csv"
+```
+
+
+
+```{r}
+process_df = function(df) {
+  df = df %>% 
+    rename(negdist=negative_distance) %>% 
+    mutate(
+      freqs = str_remove_all(freqs, "[,\\[\\]]")
+    ) %>% 
+    separate(freqs, c("freq_x", "freq_y"), sep=" ") %>% 
+    mutate_at(c("freq_x", "freq_y"), as.numeric) %>% 
+    mutate(freq_dif = log(freq_x / freq_y)) %>% 
+    # random uniform/normal (-> benchmark)
+    mutate(
+      uniform_cosine = sample(.$cosine, size=nrow(.), replace=F),
+      uniform_negdist = sample(.$negdist, size=nrow(.), replace=F)
+    )
+  return(df)
+}
+
+
+get_rmse_metric = function(df, target_var) {
+  # Root-squared Mean Sum of Squares (compara cada celda contra promedio general)
+  # el promedio general es lo esperado bajo uniformidad
+  general_avg = df[[target_var]] %>% mean()
+  df_grouped = df %>% 
+    group_by(freq_order_x, freq_order_y) %>% 
+    summarise_at(all_of(target_var), mean) %>% 
+    ungroup() 
+  res = sqrt( mean( (df_grouped[[target_var]] - general_avg)**2 ) )
+  return(res)
+}
+
+
+get_metrics = function(df) {
+  # cosine
+  rmse_cosine = get_rmse_metric(df, "cosine")
+  # uniform benchmark
+  rmse_unif_cosine = get_rmse_metric(df, "uniform_cosine")
+  # negative euclidean distance
+  rmse_negdist = get_rmse_metric(df, "negdist")
+  # uniform benchmark
+  rmse_unif_negdist = get_rmse_metric(df, "uniform_negdist")
+  # results 
+  df_res = tibble(rmse_cosine, rmse_unif_cosine, rmse_negdist, rmse_unif_negdist)
+  return(df_res)
+}
+
+clean_results = function(df) {
+  # extract info
+  df[["model"]] = df$file %>% 
+    str_match("similarities-(.+)-wiki2021s1") %>% 
+    "["(,2)
+  df[["hps"]] = df$file %>% 
+    str_match(".+wiki2021s1-(.+)\\.csv") %>% 
+    "["(,2)
+  # Glove results
+  df_glove = df %>% 
+    filter(model %in% c("glove")) 
+  df_ = df_glove %>%
+    pull(hps) %>%
+    str_split("-", simplify=T) %>% 
+    as_tibble()
+  # print(df_)
+  col_names = df_ %>% 
+    map_chr(function(x) str_extract_all(x, "[:alpha:]+", simplify=T) %>% unique())
+  names(df_) = col_names
+  df_ = df_ %>% 
+    janitor::clean_names() %>% 
+    mutate_all(function(x) str_remove_all(x, "[:alpha:]+") %>% as.numeric()) %>% 
+    rename(any_of(c(
+      vocab_size="v", window_size="w", distance_weight="d", dim="d_2", learning_rate="r", 
+      n_iter="e", wc="m", seed="s"
+    ))) %>% 
+    # normalize WC column
+    mutate(wc = case_when(
+      wc == 1 ~ "W", # W
+      wc == 2 ~ "WC", # W+C
+      TRUE ~ "ERROR"
+    ))
+  df_glove = bind_cols(df_glove, df_)
+  # SGNS/fasttext/CBOW results
+  df_gensim = df %>% 
+    filter(model %in% c("w2v", "ft")) 
+  df_ = df_gensim %>%
+    pull(hps) %>%
+    str_split("-", simplify=T) %>% 
+    as_tibble()
+  col_names = df_ %>% 
+    map(function(x) str_extract_all(x, "[:alpha:]+", simplify=T) %>% unique()) %>% 
+    map_chr(function(x) str_subset(x, "[:alpha:]+"))
+  names(df_) = col_names
+  df_ = df_ %>% 
+    janitor::clean_names() %>% 
+    mutate_all(function(x) str_remove_all(x, "[:alpha:]+") %>% as.numeric()) %>% 
+    rename(any_of(c(
+      vocab_size="v", window_size="w", dim="d", skipgram="sg", seed="s", neg_samples="ns", 
+      neg_sampling_exponent="nse", wc="wc"
+    ))) %>% 
+    # normalize WC column
+    mutate(wc = case_when(
+      wc == 0 ~ "WC", # W+C
+      wc == 1 ~ "ERROR",
+      TRUE ~ "W" # W
+    ))
+  df_gensim = bind_cols(df_gensim, df_)
+  df_res = bind_rows(df_gensim, df_glove)
+  df_res = df_res %>% 
+    mutate(model = case_when(
+      (model == "w2v") & (skipgram == 0) ~ "ERROR",
+      (model == "w2v") & (skipgram == 1) ~ "sgns",
+      TRUE ~ model
+    ))
+  return(df_res)
+}
+```
+
+
+
+```{r}
+if (file.exists(outfile)) {
+  df_res = read_csv(outfile, show_col_types=F)
+} else {
+  # make data
+  res = list()
+  for (f in files) {
+    df_ = read_csv(f, show_col_types=F)
+    df_ = process_df(df_)
+    res[[f]] = get_metrics(df_)
+  }
+  # clean results
+  df_res = bind_rows(res, .id="file")
+  df_res = clean_results(df_res)
+  df_res = df_res %>% 
+    pivot_longer(
+      cols=c(rmse_cosine, rmse_unif_cosine, rmse_negdist, rmse_unif_negdist),
+      names_to="metric", values_to="value")
+  # save
+  write_csv(df_res, file=outfile)
+}
+```
+
+
+
+## Plots
+
+```{r}
+# clean some more :)
+df_res = df_res %>% 
+  mutate(
+    distance_metric = str_match(metric, "_([a-z]+)$")[,2],
+    correlation_metric = str_match(metric, "^([a-z]+)_")[,2],
+    similarities = ifelse(str_detect(metric, "unif"), "Shuffled", "Original"),
+    model_name = case_when(
+      model %in% "ft" ~ "FastText",
+      model %in% "glove" ~ "GloVe",
+      model %in% "sgns" ~ "SGNS",
+      TRUE ~ NA_character_,
+    ) %>% factor(levels=c("SGNS", "FastText", "GloVe")),
+    distance_metric = factor(distance_metric, levels=c("cosine","negdist"), 
+                             labels=c("Cosine similarity", "Negative euclidean distance"))
+  )
+```
+
+
+
+
+```{r}
+boxplots_plt = function(df, y_var="value", color_var="window_size", facet_vars="metric",
+                        ncols=2, ylab="value", xlab=NULL, title=NULL, subtitle=NULL, 
+                        palette="Set1") {
+  df = df %>% 
+    mutate(wc = ifelse(is.na(wc), -1, wc)) %>% 
+    mutate_at(vars(window_size, neg_samples, neg_sampling_exponent, wc), as.factor) 
+  # plot
+  p = ggplot(df, aes(x=!!sym("model_name"), y=!!sym(y_var))) +
+    labs(x=xlab, y=ylab, title=title, subtitle=subtitle) +
+    theme_light() +
+    NULL
+  if (!is.null(color_var)) {
+    p = p + 
+      gg.layers::geom_boxplot2(
+        aes(color=!!sym(color_var)),
+        width.errorbar=0.2,  position="identity", notch=F) +
+      geom_jitter(aes(color=!!sym(color_var)), alpha=0.4, width=0.1) + 
+      scale_colour_brewer(palette=palette)
+  } else {
+    p = p + 
+    gg.layers::geom_boxplot2(width.errorbar=0.2, notch=F) +
+    geom_jitter(alpha=0.6, width=0.2)
+  }
+  if (!is.null(facet_vars)) {
+    p = p + 
+      facet_wrap(
+        vars(!!!map(facet_vars, sym)), ncol=ncols, scales="free_y", dir="v") +
+      theme(legend.position="bottom", strip.text.x=element_text(size=11))
+  }
+  return(p)
+}
+
+```
+
+
+```{r}
+metrics = c("Cosine similarity"="cosine", "Negative euclidean distance"="negdist")
+plot_list = list()
+
+for (metric_ in names(metrics)) {
+  set.seed(33)
+  p = df_res %>%
+    filter((model %in% c("ft", "sgns", "glove")) & (wc %in% c("W","WC"))) %>%
+    filter(correlation_metric %in% c("rmse")) %>%
+    filter(distance_metric %in% metric_) %>%
+    boxplots_plt(facet_vars=NULL, color_var="similarities", ylab="RMSE") +
+    labs(color="Heatmap\nsimilarity\nvalues") +
+    # change color title font size
+    theme(legend.title = element_text(size=8))
+    NULL
+  short_name = metrics[[metric_]]
+  plot_list[[short_name]] = p
+  print(p)
+  outname = glue("results/plots/hyperparams_rmse_{short_name}.png")
+  ggsave(outname, p, height=4.5*0.618, width=4.5, dpi=300)
+}
+```
+
+
+## Regression analysis
+
+RMSE as a function of hyperparameters
+
+```{r}
+metrics = c("Cosine similarity"="Cosine", "Negative euclidean distance"="Euclidean")
+hps = c("window_size", "neg_samples", "neg_sampling_exponent", "wc")
+models = list(c("sgns", "ft","glove"), c("sgns", "ft"))
+
+mod_list = list()
+
+for (models_ in models) {
+  for (metric_ in names(metrics)) {
+    df_tmp = df_res %>%
+      filter((model %in% models_) & (wc %in% c("W","WC"))) %>%
+      filter(correlation_metric %in% c("rmse")) %>%
+      filter(distance_metric %in% metric_) %>%
+      select(model, !!!syms(hps), value) %>% 
+      mutate_at(vars(model, !!!syms(hps)), as.factor) %>% 
+      select(-model) %>%
+      mutate(wc = case_when(wc == "W" ~ "no", wc == "WC" ~ "yes", T ~ "ERROR")) %>%
+      rename(`win=`=window_size, `w+c=`=wc, `cds=`=neg_sampling_exponent, `neg=`=neg_samples) %>%
+      select_if(function(x) sum(is.na(x)) < 1)
+    mod = lm(value ~ ., data=df_tmp)
+    mod_list = append(mod_list, list(mod))
+  }
+}
+```
+
+```{r}
+texreg(
+  mod_list, single.row=T, omit.coef="Intercept", booktabs=F,
+  custom.header = list(`SGNS+FT+GloVe`=1:2, `SGNS+FT`=3:4),
+  include.rsquared=F, include.adjrs=F
+  ) %>% 
+  str_remove_all(" \\\\; \\(\\d+\\.\\d+\\)") %>%
+  str_replace_all("`(.+)`", "\\\\texttt{\\1}") %>%
+  cat()
+```
+
+
+Plots for window_size and W+C:
+
+```{r}
+hps = c("Adding context vectors"="wc", "Window size"="window_size")
+
+for (name_hp in names(hps)) {
+  set.seed(33)
+  p = df_res %>%
+    filter((model %in% c("ft", "sgns", "glove")) & (wc %in% c("W","WC"))) %>%
+    filter(correlation_metric %in% c("rmse")) %>%
+    filter(similarities %in% "Original") %>%
+    mutate(wc = case_when(wc == "W" ~ "no", wc == "WC" ~ "yes", T ~ "ERROR")) %>% 
+    boxplots_plt(facet_vars="distance_metric", color_var=hps[name_hp], palette="Dark2") +
+    labs(y="RMSE", color=name_hp) +
+    NULL
+  p$layers[[1]] = NULL
+  print(p)
+}
+```
+

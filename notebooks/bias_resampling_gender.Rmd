@@ -1,0 +1,417 @@
+---
+title: "Sensitivity of gender bias to context frequency"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir="~/bias-frequency/")
+# setwd("~/bias-frequency/")
+```
+
+
+```{r, message=F, warning=F}
+library(tidyverse)
+library(glue)
+library(latex2exp)
+library(cowplot)
+```
+
+
+```{r}
+A = "SHE"
+B = "HE"
+```
+
+
+## Data
+
+
+```{r}
+# lists of words
+glasgow_words = readLines("words_lists/GLASGOW.txt")
+```
+
+
+```{r}
+# read bias files
+files_bias = list()
+files_bias[["sgns"]] = list.files(
+  "results", pattern=glue("bias_sgns-wiki2021.*-{A}-{B}\\.csv"), full.names=T)
+files_bias[["glove"]] = list.files(
+  "results", pattern=glue("bias_glove-wiki2021.*-{A}-{B}\\.csv"), full.names=T)
+files_bias[["fasttext"]] = list.files(
+  "results", pattern=glue("bias_fasttext-wiki2021.*-{A}-{B}\\.csv"), full.names=T)
+```
+
+
+```{r}
+for (n in names(files_bias)) {
+  corpus_names = str_match(
+    files_bias[[n]], glue("bias.+-(.+)-{A}-{B}.*\\.csv"))[,2]
+  names(files_bias[[n]]) = corpus_names
+}
+```
+
+
+
+```{r}
+# get frequencies of A/B in each corpus
+word_a = readLines(glue("words_lists/{A}.txt"))
+word_b = readLines(glue("words_lists/{B}.txt"))
+corpus_names = files_bias %>% map(names) %>% reduce(c) %>% unique()
+
+get_ab_freqs = function(corpus, a, b) {
+  freqs = readLines(glue("data/working/vocab-{corpus}-V100.txt"))
+  freq_a = freqs %>% str_subset(glue("^{a} ")) %>% 
+    str_extract("\\d+") %>% as.numeric()
+  freq_b = freqs %>% str_subset(glue("^{b} ")) %>% 
+    str_extract("\\d+") %>% as.numeric()
+  res = tibble(corpus=corpus, freq_a=freq_a, freq_b=freq_b)
+  return(res)
+}
+
+df_ab_freqs = corpus_names %>% map_dfr(function(x) get_ab_freqs(x, word_a, word_b))
+```
+
+
+```{r}
+print(
+  df_ab_freqs %>% mutate_at(c("freq_a","freq_b"), function(x) round(log10(x), 2)) 
+)
+```
+
+
+```{r}
+# read data into nested list
+dfs = list()
+for (n in names(files_bias)) {
+  files_ = files_bias[[n]]
+  dfs[[n]] = list()
+  for (corpus in names(files_)) {
+    dfs[[n]][[corpus]] = read_csv(files_[corpus], show_col_types=F)
+  }
+}
+```
+
+
+```{r}
+# concatenate dataframes
+for (n in names(dfs)) {
+  dfs[[n]] = bind_rows(dfs[[n]], .id="corpus")
+}
+```
+
+```{r}
+# rename bias
+for (n in names(dfs)) {
+  dfs[[n]] = dfs[[n]] %>% rename(bias=bias_score)
+}
+```
+
+
+```{r}
+# drop some columns
+for (n in names(dfs)) {
+  dfs[[n]] = dfs[[n]] %>% select(corpus, idx, word, freq, bias, sims_a, sims_b)
+}
+```
+
+
+
+```{r}
+# add freq of A and B in each corpus
+for (n in names(dfs)) {
+  dfs[[n]] = dfs[[n]] %>% left_join(df_ab_freqs, by="corpus")
+}
+```
+
+
+
+```{r}
+# specify freq ratios and resampling type
+for (n in names(dfs)) {
+  res_tmp = dfs[[n]][["corpus"]] %>% 
+    str_match("^.+_(undersampled|oversampled)_.+$")
+  is_shuffled = dfs[[n]][["corpus"]] %>% str_detect("s\\d$")
+  resample_type = res_tmp[,2]
+  resample_type = ifelse(is.na(resample_type), "original", resample_type)
+  dfs[[n]][["resample_type"]] = resample_type
+  dfs[[n]][["is_shuffled"]] = is_shuffled
+  dfs[[n]][["freq_ratio"]] = dfs[[n]]$freq_a / dfs[[n]]$freq_b
+}
+```
+
+
+
+## Impact
+
+```{r}
+# drop undersampling of A
+for (n in names(dfs)) {
+  dfs[[n]] = dfs[[n]] %>% 
+    filter(!str_detect(corpus, glue("undersampled_{tolower(A)}")))
+}
+```
+
+
+
+```{r}
+# keep only words in common in every vocab
+for (n in names(dfs)) {
+  dfs[[n]] = dfs[[n]] %>% 
+    group_by(word) %>% 
+    mutate( n_corpus = n() ) %>% 
+    ungroup() %>% 
+    filter(n_corpus == max(n_corpus)) %>% 
+    select(-n_corpus)
+}
+```
+
+
+
+
+```{r}
+# frequency bins
+add_frequency_bins = function(df) {
+  log_freq = log10(df[["freq"]])
+  max_value = max(log_freq)
+  cuts = unique(c(2, seq(2, 6., 1), max_value))
+  df = df %>% mutate(freq_bin = cut(log_freq, cuts, include.lowest=T))
+  return(df)
+}
+```
+
+
+
+
+```{r}
+transform_df_for_plt = function(df, words) {
+  df_res = df %>% 
+    filter(word %in% words) %>% 
+    add_frequency_bins() %>% 
+    # only words whose freq group doesnt change between corpora 
+    group_by(word) %>% 
+    mutate(nbins = length(unique(freq_bin))) %>% 
+    ungroup() %>% 
+    filter(nbins == 1) %>% 
+    mutate(f10_b = log10(freq_b))
+  cat("#words = ", df_res$word %>% unique() %>% length(), "\n")
+  return(df_res)  
+}
+
+impact_plt = function(df, title=NULL) {
+  p = ggplot(df, aes(x=f10_b, y=bias, color=freq_bin)) +
+    geom_hline(yintercept=0, linetype="dashed", size=0.2, color="black") +
+    stat_summary(fun.data="mean_cl_normal", geom="errorbar", width=.05) +
+    stat_summary(fun="mean", geom="point") + 
+    stat_summary(fun="mean", geom="line") + 
+    scale_color_viridis_d() +
+    theme_light() +
+    labs(
+      title=title, 
+      x=TeX("$\\log_{10}\\,frequency_{B}$"), 
+      y=TeX("$Bias_{WE}(x,A,B)$"),
+      color=TeX("$\\log_{10}\\,frequency_{x}$")
+    ) +
+    theme(
+      legend.position="none"
+    ) +
+    NULL
+}
+```
+
+
+```{r}
+model_names = c("sgns"="SGNS", "fasttext"="FastText", "glove"="GloVe")
+dfs_list = list()
+plot_list = list()
+for (n in names(model_names)) {
+  nombre = model_names[n]
+  dfs_list[[nombre]] = dfs[[n]] %>% 
+    filter(!is_shuffled) %>% 
+    transform_df_for_plt(glasgow_words)
+  p = impact_plt(dfs_list[[nombre]], title=nombre) +
+    labs(title=nombre)
+  plot_list[[n]] = p
+  print(p)
+}
+
+```
+
+```{r}
+# save data.frame with plot data
+df_out = dfs_list %>%
+  bind_rows(.id="WE") %>% 
+  mutate(type="Gender bias")
+write_csv(df_out, file="results/bias_resampling_gender.csv")
+```
+
+
+### Individual words
+
+
+```{r, warning=F, message=FALSE}
+# read glasgow DataFrame para definir palabras target masc y fem
+col_names1 = read_csv(
+    "data/external/GlasgowNorms.csv", n_max=0, show_col_types=F) %>%
+  names()
+col_names2 = read_csv(
+    "data/external/GlasgowNorms.csv", skip=1, n_max=0, show_col_types=F) %>%
+  names()
+col_names = paste0(col_names1, col_names2)
+df_glasgow = read_csv(
+    "data/external/GlasgowNorms.csv", skip=2, col_names=col_names, 
+    show_col_types=F)
+# clean glasgow DF
+df_glasgow = df_glasgow %>% select(word=Words, maleness=GENDM)
+# NOTE we remove words with multiple meanings!
+# they have the format: <word (meaning)>
+to_drop = str_detect(df_glasgow[["word"]], "\\s+(.+)")
+df_glasgow = df_glasgow %>% filter(!to_drop)
+# assert that there are no duplicated words
+anyDuplicated(df_glasgow[["word"]]) == 0
+df_glasgow[["score"]] = 8 - df_glasgow[["maleness"]]  # femaleness
+# keep words from list (just in case)
+df_glasgow = df_glasgow %>% filter(word %in% glasgow_words)
+df_glasgow = df_glasgow %>% select(word, score)
+
+# NOTE words with caps are removed, like "FALSE", "TV", "Facebook", "Mum" 
+```
+
+
+```{r}
+# groups of genderedness (score va de 1 a 7)
+df_glasgow = df_glasgow %>% 
+  mutate(
+    gender_group = case_when(
+      score >= 6 ~ "female-associated",
+      score <= 2 ~ "male-associated",
+      TRUE ~ "neutral"
+    ))
+```
+
+
+```{r}
+# add genderedness to dfs
+for (n in names(dfs)) {
+  dfs[[n]] = dfs[[n]] %>% left_join(df_glasgow, by="word") 
+}
+```
+
+
+```{r}
+words_plt = function(df, words=NULL, seed=33) {
+  df_tmp = df %>% 
+    add_frequency_bins() %>%
+    group_by(word) %>% 
+    mutate(nbins = length(unique(freq_bin))) %>% 
+    ungroup() %>% 
+    filter(nbins == 1) %>% 
+    mutate(f10_b = log10(freq_b))
+  # one random word by group
+  if (is.null(words)) {
+    set.seed(seed)
+    words_ = c()
+    for (tipo in unique(df_tmp$gender_group)) {
+      ws = df_tmp %>% 
+        filter(gender_group %in% tipo) %>% 
+        distinct(freq_bin, word) %>% 
+        group_by(freq_bin) %>%
+        sample_n(1) %>%
+        pull(word)
+      words_ = c(words_, ws)
+    }
+  } else {
+    words_ = words
+  }
+  df_tmp = df_tmp %>% filter(word %in% words_)
+  g = ggplot(df_tmp) +
+    geom_hline(yintercept=0, linetype="dashed", size=0.2, color="black") +
+    geom_line(aes(x=f10_b, y=bias, group=word), linetype="dashed", size=.2) +
+    geom_label(aes(x=f10_b, y=bias, label=word, fill=freq_bin), size=4, 
+               colour="white", fontface="bold",
+               label.padding=unit(0.1, "lines")) +
+    facet_wrap(vars(gender_group), nrow=nrow) +
+    scale_fill_viridis_d(drop=F) +
+    theme_light(base_size = 15) +
+    labs(
+      x=TeX("$\\log_{10}\\,frequency_{B}$"), 
+      y=TeX("$Bias_{WE}(x,A,B)$"),
+      fill=TeX("$\\log_{10}\\,frequency_{x}$")
+    ) +
+    theme(legend.position="bottom", legend.margin=margin(-5,-5,-5,-5)) +
+    NULL
+  return(g)
+}
+```
+
+
+```{r}
+for (n in names(dfs)) {
+  p = dfs[[n]] %>% 
+    filter(!is_shuffled) %>% 
+    filter(!is.na(gender_group)) %>% 
+    add_frequency_bins() %>% 
+    words_plt(seed=42) +
+    expand_limits(x = c(3.75, 7.25))
+  outname = glue("results/plots/impact-gender-words_{n}.png")
+  ggsave(outname, p, height=4, width=12, dpi=300)
+}
+```
+
+```{r}
+# We search for male/female words (stereotyped vs inherent)
+df_tmp = dfs$glove %>% 
+  filter(!is_shuffled) %>% 
+  filter(!is.na(gender_group)) %>% 
+  # filter(word %in% words) %>% 
+  add_frequency_bins() %>%
+  group_by(word) %>% 
+  mutate(nbins = length(unique(freq_bin))) %>% 
+  ungroup() %>% 
+  filter(nbins == 1) %>% 
+  mutate(f10_b = log10(freq_b)) %>% 
+  filter(corpus == "wiki2021")
+
+for (j in c("female-associated", "male-associated")) {
+  for (i in 1:5) {
+    words = df_tmp %>% 
+      filter(gender_group == j) %>%
+      filter(as.numeric(freq_bin) == i) %>% 
+      pull(word)
+    cat(j, " - ", i, "\n")
+    print(words)
+  }
+}
+```
+
+```{r}
+# Plot only for glove
+n = "glove"
+df_tmp = dfs[[n]] %>% 
+  filter(!is_shuffled) %>% 
+  add_frequency_bins() %>% 
+  mutate(
+    gender_group = case_when(
+      word %in% c("girly", "grandma", "aunt", "lady") ~ 'female-associated ("inherent")',
+      word %in% c("beautician", "lipstick", "beautiful", "birth") ~ 'female-associated ("stereotype")',
+      word %in% c("grampa", "lad", "uncle", "father") ~ 'male-associated ("inherent")',
+      word %in% c("screwdriver", "conqueror", "colonel", "army") ~ 'male-associated ("stereotype")'
+    )) %>% 
+  filter(!is.na(gender_group))
+
+p = df_tmp %>% 
+  words_plt(nrow=2) +
+  expand_limits(x = c(3.75, 7.25))
+
+print(p)
+outname = glue("results/plots/impact-gender-words_{n}_{B}_stereo-inherent.png")
+ggsave(outname, p, height=7, width=1.7*7, dpi=300)
+
+```
+
+
+```{r}
+# 
+```

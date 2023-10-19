@@ -1,0 +1,254 @@
+---
+title: "Sensitivity of affluence bias to context frequency"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir="~/bias-frequency/")
+# setwd("~/bias-frequency/")
+```
+
+
+```{r, message=F, warning=F}
+library(tidyverse)
+library(glue)
+library(latex2exp)
+library(cowplot)
+```
+
+
+```{r}
+A = "RICH"
+B = "POOR"
+```
+
+
+## Data
+
+
+```{r}
+# lists of words
+glasgow_words = readLines("words_lists/GLASGOW.txt")
+```
+
+
+```{r}
+# read bias files
+files_bias = list()
+files_bias[["sgns"]] = list.files(
+  "results", pattern=glue("bias_sgns-wiki2021.*-{A}-{B}\\.csv"), full.names=T)
+files_bias[["glove"]] = list.files(
+  "results", pattern=glue("bias_glove-wiki2021.*-{A}-{B}\\.csv"), full.names=T)
+files_bias[["fasttext"]] = list.files(
+  "results", pattern=glue("bias_fasttext-wiki2021.*-{A}-{B}\\.csv"), full.names=T)
+```
+
+
+```{r}
+for (n in names(files_bias)) {
+  corpus_names = str_match(
+    files_bias[[n]], glue("bias.+-(.+)-{A}-{B}.*\\.csv"))[,2]
+  names(files_bias[[n]]) = corpus_names
+}
+```
+
+
+
+```{r}
+# get frequencies of A/B in each corpus
+word_a = readLines(glue("words_lists/{A}.txt"))
+word_b = readLines(glue("words_lists/{B}.txt"))
+corpus_names = files_bias %>% map(names) %>% reduce(c) %>% unique()
+
+get_ab_freqs = function(corpus, a, b) {
+  freqs = readLines(glue("data/working/vocab-{corpus}-V100.txt"))
+  freq_a = freqs %>% str_subset(glue("^{a} ")) %>% 
+    str_extract("\\d+") %>% as.numeric()
+  freq_b = freqs %>% str_subset(glue("^{b} ")) %>% 
+    str_extract("\\d+") %>% as.numeric()
+  res = tibble(corpus=corpus, freq_a=freq_a, freq_b=freq_b)
+  return(res)
+}
+
+df_ab_freqs = corpus_names %>% map_dfr(function(x) get_ab_freqs(x, word_a, word_b))
+```
+
+
+```{r}
+print(
+  df_ab_freqs %>% mutate_at(c("freq_a","freq_b"), function(x) round(log10(x), 2)) 
+)
+```
+
+
+```{r}
+# read data into nested list
+dfs = list()
+for (n in names(files_bias)) {
+  files_ = files_bias[[n]]
+  dfs[[n]] = list()
+  for (corpus in names(files_)) {
+    dfs[[n]][[corpus]] = read_csv(files_[corpus], show_col_types=F)
+  }
+}
+```
+
+
+```{r}
+# concatenate dataframes
+for (n in names(dfs)) {
+  dfs[[n]] = bind_rows(dfs[[n]], .id="corpus")
+}
+```
+
+```{r}
+# rename bias
+for (n in names(dfs)) {
+  dfs[[n]] = dfs[[n]] %>% rename(bias=bias_score)
+}
+```
+
+
+```{r}
+# drop some columns
+for (n in names(dfs)) {
+  dfs[[n]] = dfs[[n]] %>% select(corpus, idx, word, freq, bias, sims_a, sims_b)
+}
+```
+
+
+
+```{r}
+# add freq of A and B in each corpus
+for (n in names(dfs)) {
+  dfs[[n]] = dfs[[n]] %>% left_join(df_ab_freqs, by="corpus")
+}
+```
+
+
+
+```{r}
+# specify freq ratios and resampling type
+for (n in names(dfs)) {
+  res_tmp = dfs[[n]][["corpus"]] %>% 
+    str_match("^.+_(undersampled|oversampled)_.+$")
+  is_shuffled = dfs[[n]][["corpus"]] %>% str_detect("s\\d$")
+  resample_type = res_tmp[,2]
+  resample_type = ifelse(is.na(resample_type), "original", resample_type)
+  dfs[[n]][["resample_type"]] = resample_type
+  dfs[[n]][["is_shuffled"]] = is_shuffled
+  dfs[[n]][["freq_ratio"]] = dfs[[n]]$freq_a / dfs[[n]]$freq_b
+}
+```
+
+
+
+## Impact
+
+
+```{r}
+# keep only words in common in every vocab
+for (n in names(dfs)) {
+  dfs[[n]] = dfs[[n]] %>% 
+    group_by(word) %>% 
+    mutate( n_corpus = n() ) %>% 
+    ungroup() %>% 
+    filter(n_corpus == max(n_corpus)) %>% 
+    select(-n_corpus)
+}
+```
+
+
+
+
+```{r}
+# frequency bins
+add_frequency_bins = function(df) {
+  log_freq = log10(df[["freq"]])
+  max_value = max(log_freq)
+  cuts = unique(c(2, seq(2, 6., 1), max_value))
+  df = df %>% mutate(freq_bin = cut(log_freq, cuts, include.lowest=T))
+  return(df)
+}
+```
+
+
+
+
+```{r}
+transform_df_for_plt = function(df, words) {
+  df_res = df %>% 
+    filter(word %in% words) %>% 
+    add_frequency_bins() %>% 
+    # only words whose freq group doesnt change between corpora 
+    group_by(word) %>% 
+    mutate(nbins = length(unique(freq_bin))) %>% 
+    ungroup() %>% 
+    filter(nbins == 1) %>% 
+    mutate(f10_b = log10(freq_b))
+  cat("#words = ", df_res$word %>% unique() %>% length(), "\n")
+  return(df_res)  
+}
+
+impact_plt = function(df, title=NULL) {
+  p = ggplot(df, aes(x=f10_b, y=bias, color=freq_bin)) +
+    geom_hline(yintercept=0, linetype="dashed", size=0.2, color="black") +
+    stat_summary(fun.data="mean_cl_normal", geom="errorbar", width=.05) +
+    stat_summary(fun="mean", geom="point") + 
+    stat_summary(fun="mean", geom="line") + 
+    scale_color_viridis_d() +
+    theme_light() +
+    labs(
+      title=title, 
+      x=TeX("$\\log_{10}\\,frequency_{B}$"), 
+      y=TeX("$Bias_{WE}(x,A,B)$"),
+      color=TeX("$\\log_{10}\\,frequency_{x}$")
+    ) +
+    theme(
+      legend.position="none"
+    ) +
+    NULL
+}
+```
+
+
+```{r}
+model_names = c("sgns"="SGNS", "fasttext"="FastText", "glove"="GloVe")
+dfs_list = list()
+plot_list = list()
+for (n in names(model_names)) {
+  nombre = model_names[n]
+  dfs_list[[nombre]] = dfs[[n]] %>% 
+    filter(!is_shuffled) %>% 
+    transform_df_for_plt(glasgow_words)
+  p = impact_plt(dfs_list[[nombre]], title=nombre) +
+    labs(title=nombre)
+  plot_list[[n]] = p
+  print(p)
+}
+
+```
+
+```{r}
+# save data.frame with plot data
+df_out = dfs_list %>%
+  bind_rows(.id="WE") %>% 
+  mutate(type="Affluence bias")
+write_csv(df_out, file="results/bias_resampling_affluence.csv")
+```
+
+
+
+```{r}
+# 
+```
+
+
+
+
+
+
+
+
+

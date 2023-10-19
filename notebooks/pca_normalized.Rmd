@@ -1,0 +1,139 @@
+---
+title: "PCA of normalized word embeddings"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir="~/bias-frequency/")
+```
+
+
+```{r, message=F, warning=F}
+library(tidyverse)
+library(scales)
+library(glue)
+library(latex2exp)
+library(cowplot)
+```
+
+
+## Data
+
+```{r}
+file = "results/pca-normalized.csv"
+file_ratios = "results/pca-normalized_ratios.csv"
+```
+
+```{r}
+df = read_csv(file, show_col_types=F)
+df_ratios = read_csv(file_ratios, show_col_types=F)
+```
+
+Ratios to long:
+
+```{r}
+df_ratios = df_ratios %>% 
+  pivot_longer(cols=-c(vectors)) %>% 
+  mutate(vectors = str_c(vectors, name, sep="-")) %>% 
+  select(-name)
+```
+
+
+Add frequency bins:
+
+```{r}
+add_frequency_bins = function(df) {
+  log_freq = log10(df[["freq"]])
+  max_value = max(log_freq)
+  cuts = c(seq(2, 6., .25), max_value)
+  df = df %>% mutate(
+    log_freq = log_freq,
+    bins = cut(log_freq, cuts, include.lowest=T)
+  )
+  return(df)
+}
+
+df = add_frequency_bins(df)
+```
+
+
+```{r}
+# get corpora and vectors names
+colnames = names(df)
+str_groups = colnames %>% str_match(glue("(.+)-(.+)-(.+)"))
+corpora = str_groups[,2] %>% na.omit() %>% unique()
+vectors_names = str_groups[,3] %>% na.omit() %>% unique()
+```
+
+
+## Plots
+
+
+```{r}
+# Plots with scatter + centroids on top:
+format_perc = function(x) scales::percent(x, accuracy=.01) 
+
+scatter_plt = function(df, x, y, color, df_ratios, title=NULL) {
+  size = .5
+  alpha = .4
+  centroids_size = 2
+  centroids_alpha = 1
+  df_centroids = df %>% 
+    group_by(bins) %>% 
+    summarise_at(c(x, y), mean) %>% 
+    ungroup()
+  ratios = df_ratios %>% 
+    filter(vectors %in% c(x,y)) %>% 
+    pull(value)
+  p = ggplot(df, aes(x=!!sym(x), y=!!sym(y))) +
+    geom_point(aes(color=!!sym(color)), size=size, alpha=alpha) +
+    geom_point(data=df_centroids, aes(fill=!!sym(color)),
+               size=centroids_size, alpha=centroids_alpha, pch=21, color="black") +
+    scale_fill_viridis_d() +
+    scale_color_viridis_d() +
+    labs(
+      title=title, 
+      x=glue("PC 1 ({format_perc(ratios[1])})"), 
+      y=glue("PC 2 ({format_perc(ratios[2])})"), 
+      fill=TeX("$\\log_{10} frequency$")
+    ) +
+    theme_light() +
+    guides(fill=guide_legend(byrow=T), color="none") +
+    theme(
+      plot.title=element_text(hjust=0.5, size=11), legend.position="none"
+    ) +
+    NULL
+    return(p)
+}
+
+model_names = c("w2v"="SGNS", "ft"="FastText", "glove"="GloVe")
+corpora = c("wiki2021"="Wikipedia", "wiki2021s1"="Shuffled Wikipedia")
+for (n in names(model_names)) {
+  plot_list = list()
+  for (corpus in names(corpora)) {
+    nombre = model_names[n]
+    nombre_corpus = corpora[corpus]
+    x_col = glue("{corpus}-{n}-0")
+    y_col = glue("{corpus}-{n}-1")
+    p = scatter_plt(
+      df, df_ratios, x=x_col, y=y_col, color="bins", 
+      title=glue("{nombre} ({nombre_corpus})"))
+    plot_list[[corpus]] = p
+    # print(p)
+  }
+  # add the legend
+  legend_color = get_legend(
+    p + guides(fill = guide_legend(ncol=1)) + theme(legend.position="right")
+  )
+  plots_grid = plot_grid(plotlist=plot_list, ncol=1)
+  grid_final = plot_grid(plots_grid, legend_color, ncol=2, rel_widths=c(1, .3)) +
+    theme(plot.background=element_rect(fill="white", color=NA))
+  outname = glue("results/plots/grid_pca-normalized_{nombre}.png")
+  save_plot(outname, grid_final, base_height=6, base_width=6, dpi=300)
+}
+```
+
+```{r}
+# 
+```
