@@ -5,7 +5,7 @@ Code to replicate [_Investigating the Frequency Distortion of Word Embeddings an
 Cite as:
 
 ```bibtex
-@inproceedings{valentini-etal-2023-pmi,
+@inproceedings{valentini-etal-2023-investigating,
     title = "{I}nvestigating the {F}requency {D}istortion of {W}ord {E}mbeddings and {I}ts {I}mpact on {B}ias {M}etrics",
     author = "Valentini, Francisco  and
       Sosa, Juan Cruz  and
